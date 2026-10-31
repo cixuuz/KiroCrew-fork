@@ -23,15 +23,19 @@ import asyncio
 import os
 import secrets
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Callable
 
+from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import fleet_state, release_channel_pin, repository, runtime
 from kiro_crew.apps.builtins.dev_fleet.worktree_ops_pods import _wt_lock
 from kiro_crew.apps.builtins.dev_fleet.worktree_ops_removal import _GIT_MUTATION_LOCK
+from kiro_crew.config.paths import data_home
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.owner_only_files import mkdirs_owner_only
 
 #: Result ``code``s that mean "the current state does not allow this", as opposed to
 #: "a git command this app runs failed unexpectedly".
@@ -556,7 +560,6 @@ async def _populate_release_tree(repo: str, staging: str, oid: str) -> str | Non
         common = await loop.run_in_executor(
             subprocess_executor(),
             _make_hermetic_common_dir,
-            str(Path(staging).parent),
             objects,
             object_format,
         )
@@ -595,8 +598,7 @@ async def _populate_release_tree(repo: str, staging: str, oid: str) -> str | Non
     finally:
         # Deleted whatever happened, including on the cancellation path: the directory
         # is this call's by construction (``mkdtemp``), holds no object of its own, and
-        # a leftover would be a private git repository sitting beside the operator's
-        # checkouts.
+        # a leftover would be a stray git repository in the gateway's private run dir.
         await loop.run_in_executor(subprocess_executor(), _discard_hermetic_common_dir, common)
     if rc != 0:
         return runtime._error_detail(err) or "git read-tree failed"
@@ -644,18 +646,47 @@ async def _hermetic_paths(repo: str, staging: str) -> tuple[str, str, str, str |
     return gitdir, objects, object_format, None
 
 
-def _make_hermetic_common_dir(parent: str, objects: str, object_format: str) -> str:
+#: Leaf of ``<data home>/run`` that holds the populate's throwaway common dirs.
+_HERMETIC_COMMON_LEAF = "dev-fleet-gitcommon"
+
+
+def _hermetic_common_root() -> str:
+    """The owner-only directory every throwaway common dir is created in.
+
+    NOT beside the staging worktree: that parent is the directory every agent worktree
+    shares, so a same-user process with write access to it (an agent) could watch for
+    the ``mkdtemp`` and plant a ``filter.<name>.smudge`` driver in its ``config`` --
+    0700 keeps other USERS out, not the same uid -- before ``read-tree`` ran it.
+    ``<data home>/run`` is withheld from sandboxed children (``sandbox_leaves``), so
+    no agent can reach this leaf. Verified rather than trusted: the leaf must be a real
+    directory (not a link), owned by this uid, with no group or other bits; an owned
+    directory that is merely too open is tightened, anything else refuses (``OSError``,
+    which the caller reports). The ownership check is POSIX-only, like the mode.
+    """
+    root = os.path.join(str(data_home()), "run", _HERMETIC_COMMON_LEAF)
+    mkdirs_owner_only(root)
+    if not platform_compat.IS_POSIX:
+        return root
+    info = os.lstat(root)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise OSError(f"{root} is not a directory owned by this user")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        os.chmod(root, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
+        if stat.S_IMODE(os.lstat(root).st_mode) & 0o077:
+            raise OSError(f"{root} cannot be made owner-only")
+    return root
+
+
+def _make_hermetic_common_dir(objects: str, object_format: str) -> str:
     """Create the throwaway git common dir the populate reads config from.
 
     Runs on the executor: four file writes and a ``mkdtemp``. ``mkdtemp`` creates the
     directory 0700 and with a name no other process can predict, which is what makes
-    the later delete this call's own.
-
-    Placed beside the staging worktree rather than in the system temp dir so it shares
-    the filesystem and the access rules of the trees this app already writes, and so an
-    operator who finds a leftover finds it next to the tree it belonged to.
+    the later delete this call's own. It is created inside
+    :func:`_hermetic_common_root`, a directory no agent can write, so nothing but this
+    call can add to its ``config`` between the write below and the populate.
     """
-    common = tempfile.mkdtemp(prefix=".release-channel-gitcommon.", dir=parent)
+    common = tempfile.mkdtemp(prefix="release-channel-gitcommon.", dir=_hermetic_common_root())
     os.makedirs(os.path.join(common, "objects", "info"), exist_ok=True)
     os.makedirs(os.path.join(common, "refs"), exist_ok=True)
     for relative, text in (

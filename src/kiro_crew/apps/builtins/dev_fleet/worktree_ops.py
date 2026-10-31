@@ -879,6 +879,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _discard_failed_lane_creation,
         _discard_hermetic_common_dir,
         _hermetic_common_config,
+        _hermetic_common_root,
         _hermetic_paths,
         _is_partial_clone,
         _lane_staging_path,
@@ -919,11 +920,17 @@ if TYPE_CHECKING:  # names it serves from outside the owner family, from their h
         live,
         npm_preflight,
     )
+    from kiro_crew.config.paths import (  # noqa: F401
+        data_home,
+    )
     from kiro_crew.executors import (  # noqa: F401
         subprocess_executor,
     )
     from kiro_crew.git_config_hooks import (  # noqa: F401
         ConfigHookScanError,
+    )
+    from kiro_crew.owner_only_files import (  # noqa: F401
+        mkdirs_owner_only,
     )
     from kiro_crew.sandbox import (  # noqa: F401
         sandboxed_spawn_argv,
