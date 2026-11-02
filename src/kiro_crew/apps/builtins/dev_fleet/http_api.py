@@ -82,11 +82,42 @@ async def _with_live_run_pointers(data: dict) -> dict:
     return {**data, "worktrees": rows, "sync_run_id": worktree_ops._SYNC_RID}
 
 
+async def _fetch_release_mirror() -> None:
+    """Refresh the release channel's tag mirror for an operator-requested rebuild.
+
+    The background refresher does not fetch the mirror; it is refreshed on demand
+    only -- here, for the page's Refresh button, and by Create before it resolves.
+    A failure is logged, never raised: the fleet is still rebuilt from the last
+    mirror a fetch brought in, exactly as the channel's ``error`` stays reserved for
+    a git failure that blocks Create.
+    """
+    try:
+        repo = repository._repo()
+    except repository.RepoUnavailable:
+        return  # nothing to fetch into; the rebuild below reports the state
+    try:
+        fetch_err = await release_channel_pin.fetch_refs(repo, timeout=90)
+    except RuntimeError as exc:  # `_run_cmd`'s sandbox/spawn failure
+        fetch_err = runtime._redact(str(exc))
+    if fetch_err:
+        runtime.logger.warning(
+            "dev-fleet: release-tag mirror fetch failed; channel resolved from the"
+            " last fetched mirror: %s",
+            fetch_err,
+        )
+
+
 async def api_dev_fleet_fleet(request: web.Request) -> web.Response:
     fresh = request.query.get("fresh") == "1"
+    # `fetch=1` (with `fresh=1`) is the operator's explicit Refresh: it also brings
+    # the release-tag mirror up to date before the rebuild. Post-mutation rebuilds
+    # leave it off so they do not wait on the network.
+    fetch = fresh and request.query.get("fetch") == "1"
     # The one route whose answer a late resolution changes, and the one the page
     # polls while it is showing the setup card. Costs nothing once resolved.
     await worktree_ops._ensure_repo_resolved()
+    if fetch:
+        await _fetch_release_mirror()
     try:
         data = (
             (await fleet_state._fleet_refresh()) if fresh else (await fleet_state._fleet_cached())

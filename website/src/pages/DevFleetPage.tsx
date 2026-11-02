@@ -202,9 +202,12 @@ export default function DevFleetPage() {
   // pruned worktree would keep rendering until that rebuild lands. `fresh=1`
   // forces the rebuild and the backend coalesces concurrent ones onto a single
   // build. Falls back to a plain invalidate if the fresh fetch fails.
-  const refetchFleetFresh = useCallback(async () => {
+  // `fetchMirror` is for the explicit Refresh button only: the release channel's
+  // tag mirror is refreshed on demand (no background fetch), so Refresh asks the
+  // backend to fetch it before the rebuild; post-mutation rebuilds skip that wait.
+  const refetchFleetFresh = useCallback(async (fetchMirror = false) => {
     try {
-      const data = await api.get<FleetData>('/fleet?fresh=1')
+      const data = await api.get<FleetData>(fetchMirror ? '/fleet?fresh=1&fetch=1' : '/fleet?fresh=1')
       if (data) queryClient.setQueryData(['dev-fleet', 'fleet'], data)
       else queryClient.invalidateQueries({ queryKey: ['dev-fleet', 'fleet'] })
     } catch {
@@ -212,8 +215,8 @@ export default function DevFleetPage() {
     }
   }, [queryClient])
   const invalidateFleet = useCallback(() => { void refetchFleetFresh() }, [refetchFleetFresh])
-  const invalidateAll = useCallback(() => {
-    void refetchFleetFresh()
+  const invalidateAll = useCallback((fetchMirror = false) => {
+    void refetchFleetFresh(fetchMirror)
     queryClient.invalidateQueries({ queryKey: ['dev-fleet', 'disk'] })
   }, [refetchFleetFresh, queryClient])
 
@@ -1569,7 +1572,7 @@ export default function DevFleetPage() {
                     progress", but nothing is deleted until the review dialog is
                     confirmed. `aria-busy` stays as-is for assistive tech. */}
                 <Btn danger={!busy['__prune']} onClick={pruneShipped} disabled={!!busy['__prune']} aria-busy={!!busy['__prune']}>{iconLabel(busy['__prune'] ? <LoaderCircle className="lucide-inline animate-spin" /> : <Trash2 size={13} className="lucide-inline" />, i18nT(busy['__prune'] ? 'pages.devFleetPage.scanning_merged' : 'pages.devFleetPage.prune_merged'))}</Btn>
-                <Btn onClick={() => invalidateAll()} disabled={loading} aria-label={i18nT('pages.devFleetPage.refresh_fleet')}>{iconLabel(<RefreshCw size={14} className="lucide-inline" />, i18nT('pages.devFleetPage.refresh'))}</Btn>
+                <Btn onClick={() => invalidateAll(true)} disabled={loading} aria-label={i18nT('pages.devFleetPage.refresh_fleet')}>{iconLabel(<RefreshCw size={14} className="lucide-inline" />, i18nT('pages.devFleetPage.refresh'))}</Btn>
               </div>
               )}
               <div className="overflow-x-auto -mx-1 px-1">

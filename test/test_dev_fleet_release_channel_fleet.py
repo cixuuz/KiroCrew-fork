@@ -3,8 +3,9 @@
 Sibling of ``test_dev_fleet_release_channel_ops.py`` (which holds the Create mutation
 and the row's classification) carrying the three places the channel reaches beyond
 its own row: the ``_drop_worktrees`` reconciliation a tombstoned removal gets, the
-prune verdict that must never preselect the pin, and the background refresher's
-fetch shape. Split out for the file line cap; one subject per module.
+prune verdict that must never preselect the pin, the background refresher's fetch
+shape (base branch only), and the on-demand mirror fetch behind the page's Refresh.
+Split out for the file line cap; one subject per module.
 """
 
 from __future__ import annotations
@@ -165,33 +166,33 @@ async def test_prune_still_offers_a_branch_checkout_holding_the_reserved_name(
 # refresher
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_the_refresher_fetches_the_base_branch_and_the_mirror_in_separate_spawns(
+async def test_the_refresher_fetches_the_base_branch_but_never_the_release_mirror(
     monkeypatch, tmp_path
 ):
-    """Two fetches per cycle, each its own argv, so their failures stay apart.
+    """The tag mirror is refreshed on demand only, so a cycle fetches the base branch alone.
 
     The base branch is what every row's Behind is measured against and is fetched as
-    it was before the channel existed; the mirror refspec is the channel's. A mirror
-    the remote cannot serve must not leave Behind stale, and here it does not: the base
-    fetch runs first and on its own, the mirror fetch fails, and the fleet is still
-    rebuilt.
+    it was before the channel existed. The mirror refspec is the channel's, and the
+    refresher must not spend a network fetch on it every cycle.
     """
     calls: list[list[str]] = []
     rebuilt = asyncio.Event()
 
     async def fake_run(cmd, **kw):
         calls.append(list(cmd))
-        if release_channel_pin._TAG_REFSPEC in cmd:
-            return 128, "", "fatal: could not read from remote repository"
         return 0, "", ""
 
     async def fake_refresh():
         rebuilt.set()
         return {}
 
+    async def no_mirror_fetch(*_a, **_kw):
+        raise AssertionError("the refresher fetched the release-tag mirror")
+
     monkeypatch.setattr(repository, "_repo", lambda: str(tmp_path))
     monkeypatch.setattr(repository, "_upstream_remote", _async_return("origin"))
     monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+    monkeypatch.setattr(release_channel_pin, "fetch_refs", no_mirror_fetch)
     monkeypatch.setattr(fleet_state, "_fleet_refresh", fake_refresh)
     task = asyncio.create_task(worktree_ops._status_refresher())
     try:
@@ -202,10 +203,83 @@ async def test_the_refresher_fetches_the_base_branch_and_the_mirror_in_separate_
             await task
 
     fetches = [cmd for cmd in calls if "fetch" in cmd]
-    assert len(fetches) == 2, fetches
-    base, mirror = fetches
+    assert len(fetches) == 1, fetches
+    (base,) = fetches
     assert repository.BASE_BRANCH in base
     assert release_channel_pin._TAG_REFSPEC not in base
-    assert release_channel_pin._TAG_REFSPEC in mirror
-    assert repository.BASE_BRANCH not in mirror
-    assert "--prune" not in base, "pruning is the mirror fetch's job, scoped to its namespace"
+    assert "--prune" not in base
+
+
+# --------------------------------------------------------------------------
+# on-demand mirror refresh
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "fetched"),
+    [("?fresh=1&fetch=1", True), ("?fresh=1", False), ("?fetch=1", False), ("", False)],
+)
+async def test_only_an_explicit_refresh_fetches_the_release_mirror(
+    monkeypatch, tmp_path, query, fetched
+):
+    """``/api/fleet?fresh=1&fetch=1`` (the page's Refresh) is the on-demand mirror path.
+
+    It fetches the mirror BEFORE the rebuild, so the rebuilt channel row resolves
+    against what was just fetched; a plain read or a post-mutation rebuild does not
+    wait on the network.
+    """
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from kiro_crew.apps.builtins.dev_fleet import http_api
+
+    order: list[str] = []
+
+    async def fake_fetch(repo, **_kw):
+        assert repo == str(tmp_path)
+        order.append("fetch")
+        return None
+
+    async def fake_build():
+        order.append("build")
+        return {"worktrees": []}
+
+    async def fake_live(data):
+        return data
+
+    monkeypatch.setattr(worktree_ops, "_ensure_repo_resolved", _async_return(None))
+    monkeypatch.setattr(repository, "_repo", lambda: str(tmp_path))
+    monkeypatch.setattr(release_channel_pin, "fetch_refs", fake_fetch)
+    monkeypatch.setattr(fleet_state, "_fleet_refresh", fake_build)
+    monkeypatch.setattr(fleet_state, "_fleet_cached", fake_build)
+    monkeypatch.setattr(http_api, "_with_live_run_pointers", fake_live)
+    app = web.Application()
+    app.router.add_get("/api/fleet", http_api.api_dev_fleet_fleet)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(f"/api/fleet{query}")
+        assert resp.status == 200
+
+    assert order == (["fetch", "build"] if fetched else ["build"])
+
+
+@pytest.mark.asyncio
+async def test_a_failed_on_demand_mirror_fetch_still_rebuilds_the_fleet(monkeypatch, tmp_path):
+    """A mirror the remote cannot serve is logged, and the rows are rebuilt from the last one."""
+    from kiro_crew.apps.builtins.dev_fleet import http_api
+
+    monkeypatch.setattr(repository, "_repo", lambda: str(tmp_path))
+    monkeypatch.setattr(release_channel_pin, "fetch_refs", _async_return("fatal: no remote"))
+    warnings: list[tuple] = []
+    monkeypatch.setattr(runtime.logger, "warning", lambda *a, **_k: warnings.append(a))
+    await http_api._fetch_release_mirror()
+    assert warnings and "fatal: no remote" in warnings[0]
+
+    def unavailable():
+        raise repository.RepoNotConfigured("no checkout")
+
+    monkeypatch.setattr(repository, "_repo", unavailable)
+
+    async def no_fetch(*_a, **_kw):
+        raise AssertionError("fetched with no checkout")
+
+    monkeypatch.setattr(release_channel_pin, "fetch_refs", no_fetch)
+    await http_api._fetch_release_mirror()  # no checkout: nothing to fetch into

@@ -537,33 +537,19 @@ async def _status_refresher() -> None:
         return
     while True:
         try:
-            # Two fetches, two spawns, on purpose. The base branch is what every row's
-            # Behind is measured against and is fetched exactly as it was before the
-            # release channel existed; the channel's mirror refspec is fetched by
-            # `release_channel_pin.fetch_refs`, pruned, so a newly published release
-            # becomes visible BETWEEN mutations and a forged or retracted mirror ref
-            # does not survive a cycle. Keeping them apart is what keeps their failures
-            # apart: a mirror the remote cannot serve leaves Behind moving, and a base
-            # branch that will not fetch leaves the channel's badge honest.
-            #
-            # The mirror fetch is delegated rather than spelled here: this refresh and
-            # the one before a mutation must populate the same mirror under the same
-            # rules, and a second spelling that drifted would leave the channel
-            # resolving against a mirror nothing updates -- indistinguishable from a
-            # repo that has published nothing new.
-            #
-            # Unconditional. Gating the mirror fetch on a lane existing would mean a
-            # `git worktree list` every cycle plus a fail-open branch, to avoid a cost
-            # nothing measured: tags are small refs and only the first fetch transfers
-            # them, so an install with no lane pays approximately nothing.
+            # The base branch only, exactly as before the release channel existed:
+            # every row's Behind is measured against it. The channel's tag mirror is
+            # NOT fetched here -- it is refreshed on demand only, by Create (which
+            # fetches before it resolves) and by the page's Refresh button
+            # (`/api/fleet?fresh=1&fetch=1`). Between those, the channel row is
+            # resolved from the last mirror a fetch brought in, so its badge can lag a
+            # newly published release until the operator refreshes.
             #
             # A failed fetch is logged, never raised, and the fleet is still rebuilt
             # from what this checkout holds: every row's Behind is measured against the
-            # last `<remote>/<base>` a fetch brought in, and the channel against the
-            # last mirror. Nothing in the payload marks that staleness -- the channel's
-            # `error` is reserved for a git failure that blocks Create, which a
-            # transient network blip is not -- so the log line is the one place the
-            # operator can see why a badge stopped moving.
+            # last `<remote>/<base>` a fetch brought in. Nothing in the payload marks
+            # that staleness, so the log line is the one place the operator can see why
+            # Behind stopped moving.
             remote = await repository._upstream_remote()
             fetched = await runtime._run_cmd(
                 ["git", "-C", repo, "fetch", remote, repository.BASE_BRANCH, "--quiet"],
@@ -591,13 +577,6 @@ async def _status_refresher() -> None:
             await asyncio.get_running_loop().run_in_executor(
                 executors.subprocess_executor(), reap_stale_tmp_packs, repo
             )
-            fetch_err = await release_channel_pin.fetch_refs(repo, timeout=90)
-            if fetch_err:
-                runtime.logger.warning(
-                    "dev-fleet: refresher release-tag mirror fetch failed; channel"
-                    " resolved from the last fetched mirror: %s",
-                    fetch_err,
-                )
             await fleet_state._fleet_refresh()
         except Exception:
             runtime.logger.exception("dev-fleet status refresher failed")

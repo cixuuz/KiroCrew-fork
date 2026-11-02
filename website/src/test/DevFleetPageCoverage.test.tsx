@@ -1529,6 +1529,24 @@ describe('DevFleetPage post-action refresh', () => {
     await waitFor(() => expect(urls.length).toBeGreaterThan(before + 1))
     expect(screen.getByText('wt-a')).toBeInTheDocument()
   })
+
+  it('asks for the release-tag mirror fetch only from the Refresh button', async () => {
+    // The mirror has no background fetch: Refresh is the on-demand path, so it
+    // alone carries `fetch=1`; the page's ordinary reads never do.
+    const urls: string[] = []
+    installFetch(null, (u) => {
+      if (u.includes('/fleet')) {
+        urls.push(u)
+        return res(fleetOf(MAIN_ROW, readyRow()))
+      }
+      return null
+    })
+    renderPage()
+    await waitForRow('wt-a')
+    expect(urls.some((u) => u.includes('fetch=1'))).toBe(false)
+    fireEvent.click(screen.getByLabelText('Refresh fleet'))
+    await waitFor(() => expect(urls.some((u) => u.includes('fresh=1&fetch=1'))).toBe(true))
+  })
 })
 
 describe('DevFleetPage prune discard-untracked', () => {

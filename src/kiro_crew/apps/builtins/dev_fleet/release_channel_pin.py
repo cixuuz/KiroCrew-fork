@@ -125,11 +125,11 @@ _TAG_NS = "refs/dev-fleet/release-tags"
 #: overwrite the mirror rather than being skipped as a non-fast-forward: the mirror
 #: is a cache of the remote's answer, not history anyone builds on.
 #:
-#: Exported because two callers fetch for this channel -- :func:`fetch_refs` before a
-#: mutation, and the background refresher every cycle -- and a refspec spelled twice
-#: is a refspec that drifts. The one that drifted would fail silently: the channel
-#: would resolve against a mirror that stopped being updated, which reads exactly
-#: like a repo that has published nothing new.
+#: Spelled once, here, and fetched only through :func:`fetch_refs` -- by Create before
+#: it resolves and by the page's Refresh -- because a refspec spelled twice is a
+#: refspec that drifts. The one that drifted would fail silently: the channel would
+#: resolve against a mirror that stopped being updated, which reads exactly like a
+#: repo that has published nothing new.
 _TAG_REFSPEC = f"+refs/tags/v*:{_TAG_NS}/v*"
 
 #: Serializes :func:`fetch_refs` within one event loop (see its body for why).
@@ -183,14 +183,16 @@ async def fetch_refs(repo: str, *, timeout: int = 120) -> str | None:
 
     Returns ``None`` on success, else the error to report. Called before every
     resolve that must be current, so a mutation acts on the channel's real tip
-    rather than on whatever the mirror held a cycle ago. The background refresher
-    calls it every cycle too, which is what keeps the fleet ROWS honest between
-    mutations; this call is what makes a Create honest at the moment it runs.
+    rather than on whatever the mirror held before. The mirror is refreshed on
+    demand only: Create calls this, and so does the page's Refresh
+    (``/api/fleet?fresh=1&fetch=1``). The background refresher does NOT, so between
+    those the fleet ROWS resolve from the last fetched mirror and the badge can lag a
+    newly published release until the operator refreshes.
 
     One refspec, one spawn, one destination namespace. The fetch names
-    :data:`_TAG_REFSPEC` and nothing beside it: not the base branch (the refresher
-    fetches that in its own spawn, so a mirror failure cannot leave Behind stale and a
-    base-branch failure cannot block the channel), and not the operator's own
+    :data:`_TAG_REFSPEC` and nothing beside it: not the base branch (the background
+    refresher fetches that in its own spawn, so a mirror failure cannot leave Behind
+    stale and a base-branch failure cannot block the channel), and not the operator's own
     ``refs/tags/`` (nothing here writes a ref the operator did not ask for; the row
     publishes the mirror ref it resolved, see :func:`_resolve_tagged`). The channel
     reads only the mirror, so a tag that reaches ``refs/tags/`` by any other route
@@ -230,7 +232,7 @@ async def fetch_refs(repo: str, *, timeout: int = 120) -> str | None:
     yanked release on the next fetch, while ``refs/tags/`` is untouched so the operator
     can still see and check out a tag locally after upstream drops it.
     """
-    # One fetch at a time. The refresher and a Create both call this on the same refs,
+    # One fetch at a time. A Refresh and a Create both call this on the same refs,
     # and two concurrent fetches contend for the same ref locks: the loser exits with
     # ``cannot lock ref``, which for a Create is a ``fetch_failed`` refusal of a click
     # that would have succeeded a second later. Per event loop, like every lock in this
@@ -248,7 +250,7 @@ async def fetch_refs(repo: str, *, timeout: int = 120) -> str | None:
                 # ``remote.<name>.pruneTags``) in this repository's own ``.git/config``
                 # would make ``--prune`` with explicit refspecs ALSO prune
                 # ``refs/tags/`` -- the operator's local-only tags deleted on every
-                # refresher cycle, from a file an agent can write. The flag pins the
+                # mirror fetch, from a file an agent can write. The flag pins the
                 # scoping the docstring above promises, whatever the config says.
                 "--no-prune-tags",
                 # Tag auto-follow is ON by default even with an explicit refspec: git
@@ -395,9 +397,10 @@ async def list_release_tags(repo: str) -> list[str] | None:
     An EMPTY mirror is not an error and must not be reported as one. It is the state of
     a checkout that has not fetched yet, and the caller renders it the same way as a
     repo that has published nothing -- which is honest, because an unfetched mirror is
-    precisely a checkout that does not know what is published. The next refresher cycle
-    fills it. ``None`` is reserved for git itself failing, which is a different row (an
-    error the operator is shown) and must stay distinguishable.
+    precisely a checkout that does not know what is published. The next mirror fetch
+    (a Refresh or a Create) fills it. ``None`` is reserved for git itself failing,
+    which is a different row (an error the operator is shown) and must stay
+    distinguishable.
     """
     listed = await repository._git(
         repo,

@@ -275,7 +275,7 @@ verification. Route names below are relative to that prefix.
 | Route | Description |
 |-------|-------------|
 | `/apps/dev-fleet/api/health` | Liveness + gateway **start identity**: `{status, start_id}`. `start_id` is the live unit's `ExecMainStartTimestampMonotonic` (launchd: job PID; foreground last resort: run-marker pid; `null` when unavailable); the dashboard polls it to detect the NEW process after a restart (see Action narration). Served on the proxied `/api/` namespace because the gateway only forwards `/apps/dev-fleet/api/*` to the backend. (The bare `/health` carries the same body but is HMAC-exempt and reached only by the gateway's own internal liveness poll.) |
-| `/apps/dev-fleet/api/fleet` | Lightweight worktree + pod list (polled every 12s), including `main_repo` and `main_repo_inferred`. `?fresh=1` forces cache bypass. Answers `{worktrees: [], needs_setup: true}` when no main checkout was found (see Main Checkout Discovery) and `{worktrees: [], error}` when a named checkout is unreadable. |
+| `/apps/dev-fleet/api/fleet` | Lightweight worktree + pod list (polled every 12s), including `main_repo` and `main_repo_inferred`. `?fresh=1` forces cache bypass; `?fresh=1&fetch=1` (the page's Refresh button) also fetches the release channel's tag mirror first, the on-demand mirror refresh. Answers `{worktrees: [], needs_setup: true}` when no main checkout was found (see Main Checkout Discovery) and `{worktrees: [], error}` when a named checkout is unreadable. |
 | `/apps/dev-fleet/api/worktree?name=` | Lazy per-branch detail: PR, commits, disk usage |
 | `/apps/dev-fleet/api/pod/logs?name=&n=` | Pod journal tail (recent N lines, default 120, clamped to 1..1000) |
 | `/apps/dev-fleet/api/run?id=` | Async run status + streamed output (last 60 lines), plus `cause` on a sync failure the gateway can name, and `result` on a finished in-process run (the release-channel create) |
@@ -881,8 +881,9 @@ would keep doing so until someone reinstalled by hand.
 
 ## Background Tasks
 
-- **Status refresher** (`_status_refresher`) — runs every 60s, fetches origin + refreshes
-  fleet cache. Started via `dev_fleet_startup` on app startup.
+- **Status refresher** (`_status_refresher`) — runs every 60s, fetches the base branch
+  from origin + refreshes fleet cache. It does not fetch the release channel's tag mirror,
+  which is refreshed on demand only (see the release channel's fetch rules). Started via `dev_fleet_startup` on app startup.
 - **Auto-prune reaper** (`_auto_prune_reaper`) — opt-in background loop that removes
   merged worktrees on a timer, reusing the manual-prune verdict (`_prune_candidates`,
   filtered to `code == "merged"` only — the stale-empty class stays manual) and
@@ -1675,21 +1676,24 @@ sorting a truncated set, which could silently pick the wrong release.
 
 An **empty mirror is a state, not an error**. A checkout that has not fetched genuinely does
 not know what is published, so it reads as "no release found" — the payload's `unpublished`
-— and the next refresher cycle fills it; `None` from the listing is reserved for git itself
+— and the next mirror fetch (a Refresh or a Create) fills it; `None` from the listing is reserved for git itself
 failing, which is a red row. Conflating them would either put an error on an ordinary cold
 start or, worse, invite a fallback to `refs/tags/` on exactly the path where the mirror is
 least trustworthy.
 
 Create fetches **before** resolving, so it acts on the channel's real tip; resolving first
-would pin a months-old release and call it the tip. The background `_status_refresher` tick
-refreshes the mirror on every cycle with the same fetch argv, and that is load-bearing
-rather than tidy: without it the mirror is refreshed only *inside* a mutation, so `at_tip`
-reads true against a stale mirror and the version badge describes a tip that has already
-moved. With no in-place advance, the row's report IS the whole product of resolution — an
-operator decides whether to remove and re-create from what it says — so a stale one is the
-only failure mode left. It fetches for every install, ungated: tags are small refs and only
-the first fetch transfers them, so an operator without the worktree pays approximately
-nothing, where a gate would cost a `git worktree list` each cycle plus a fail-open branch.
+would pin a months-old release and call it the tip. **The mirror is refreshed on demand
+only.** The background `_status_refresher` does not fetch it; the two paths that do are
+Create and the page's **Refresh** button, which requests `/api/fleet?fresh=1&fetch=1` so
+the handler calls `fetch_refs` (same argv, same `_FETCH_LOCK`) before rebuilding the fleet.
+Every other read — the poll, and the `fresh=1` rebuild after a mutation — leaves `fetch`
+off and resolves from the last mirror a fetch brought in, so it never waits on the network.
+The cost is staleness between refreshes: until the operator presses Refresh (or runs a
+Create), `at_tip` can read true against a stale mirror and the version badge can describe a
+tip that has already moved. With no in-place advance the row's report is the whole product
+of resolution, so an operator deciding whether to remove and re-create should Refresh
+first. A failed on-demand fetch is logged and the fleet is still rebuilt from the last
+mirror.
 
 **The mirror is PRUNED, and that is what makes it a fact rather than a habit.** The fetch
 that writes the mirror carries `--prune`, so a mirror ref the remote does not advertise is
@@ -1717,28 +1721,28 @@ that contributes an implicit `+refs/tags/*:refs/tags/*` and destroys the operato
 it stays refused, and a test asserts its absence. The pruning fetch also passes
 `--no-prune-tags` explicitly: `fetch.pruneTags` (or `remote.<name>.pruneTags`) in the
 repository's own `.git/config` — a file an agent can write — would otherwise switch that
-implicit refspec on for every refresher cycle. The flag pins the scoping whatever the config
+implicit refspec on for every mirror fetch. The flag pins the scoping whatever the config
 says. This follows from the documented scoping rule rather than from one measured version,
 since `--prune-tags` is the opt-in shorthand git **2.17 added**, so no older git prunes
 `refs/tags/` more eagerly than this does.
 
-One fetch runs at a time per event loop (`_FETCH_LOCK`): the refresher and a Create fetch the
+One fetch runs at a time per event loop (`_FETCH_LOCK`): a Refresh and a Create fetch the
 same refs, and two concurrent fetches contend for the same ref locks, so the loser's `cannot
 lock ref` would refuse a Create that a second later succeeds. A second gateway is its own
-fetcher; git's lock files arbitrate between processes. A failed refresher fetch is logged and
+fetcher; git's lock files arbitrate between processes. A failed Refresh fetch is logged and
 the fleet is still rebuilt from what the mirror holds: the mirror *is* what this checkout has
 fetched, exactly as every row's Behind is measured against the last `<remote>/<base>` a fetch
 brought in. The channel's `error` is reserved for a git failure that blocks Create, which a
 transient network failure is not.
 
-**The refresher's two fetches are two spawns, so their failures stay apart.** Every cycle
-the refresher fetches the base branch exactly as it did before the channel existed (`git
-fetch <remote> <base> --quiet`, its own argv, no pruning) and then calls `fetch_refs` for the
-mirror. The base branch is what every row's Behind is measured against; the mirror is the
-channel's alone. Sharing one argv would have made a mirror the remote cannot serve leave
-Behind stale for every row, and a base branch that will not fetch block the channel. Each
-failure is logged with its own line and the fleet is still rebuilt from what this checkout
-holds.
+**The base branch and the mirror are never one fetch, so their failures stay apart.** Every
+cycle the refresher fetches the base branch exactly as it did before the channel existed (`git
+fetch <remote> <base> --quiet`, its own argv, no pruning) and nothing else; the mirror is
+fetched only by `fetch_refs`, in its own spawn, on a Refresh or a Create. The base branch is
+what every row's Behind is measured against; the mirror is the channel's alone. Sharing one
+argv would have made a mirror the remote cannot serve leave Behind stale for every row, and a
+base branch that will not fetch block the channel. Each failure is logged with its own line
+and the fleet is still rebuilt from what this checkout holds.
 
 **Pruning bounds persistence, not timing, so the checkout does not trust the mirror.**
 `--prune` deletes only refs the remote does not advertise *at fetch time*; it cannot touch a
@@ -1768,7 +1772,7 @@ rather than from the exit code. A failed query refuses, and an unadvertised tag 
 than silently falling back to the real oid, because a silent correction would materialize the
 right tree and hide that the ref store had been written to.
 
-The background refresher shares the window but not the consequence: it resolves for the row
+The fleet rebuild shares the window but not the consequence: it resolves for the row
 badge only and checks nothing out, so the worst case there is a mislabeled row that the next
 fetch prunes. Create re-fetches independently, so a forged badge cannot carry into a checkout.
 
